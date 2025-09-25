@@ -1,253 +1,284 @@
+// CannonMPI_pt2pt.cpp
+// Parallel matrix multiplication using Cannon's algorithm.
+// Data distribution and collection use only point-to-point primitives (MPI_Send/MPI_Recv).
+// Build: mpicxx -O2 -std=c++11 CannonMPI_pt2pt.cpp -o cannon_pt2pt
+// Run example (4 processes): mpirun -np 4 ./cannon_pt2pt 8 8 8
+// Command line args: M K N  (A is MxK, B is KxN -> C is MxN)
+// NOTE: number of processes must be a perfect square and M,N must be divisible by sqrt(p).
+
 #include <mpi.h>
-#include <iostream>
-#include <vector>
-#include <cstdlib>
-#include <ctime>
-#include <cmath>
-#include <iomanip>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <math.h>
+#include <chrono>
 
 using namespace std;
+using namespace std::chrono;
 
-// Matrix element access in row-major order
-#define IDX(i, j, ld) ((i) * (ld) + (j))
-
-// Multiply blocks: C_block += A_block * B_block
-void multiply_add_blocks(const vector<double>& A, const vector<double>& B, vector<double>& C,
-                         int block_rows, int block_inner, int block_cols) {
-    for (int i = 0; i < block_rows; ++i) {
-        for (int j = 0; j < block_cols; ++j) {
-            double sum = 0;
-            for (int k = 0; k < block_inner; ++k) {
-                sum += A[IDX(i, k, block_inner)] * B[IDX(k, j, block_cols)];
-            }
-            C[IDX(i, j, block_cols)] += sum;
-        }
+// allocate contiguous rows x cols matrix and return int** where row pointers point into a contiguous block.
+// Free by freeMatrix(mat)
+int allocMatrix(int*** mat, int rows, int cols) {
+    int *data = (int*)malloc(sizeof(int) * rows * cols);
+    if (!data) return -1;
+    int **m = (int**)malloc(sizeof(int*) * rows);
+    if (!m) {
+        free(data);
+        return -1;
     }
+    for (int i = 0; i < rows; ++i) m[i] = data + i * cols;
+    *mat = m;
+    return 0;
 }
 
-// Serial matrix multiplication for correctness check
-void serial_matrix_mult(const vector<double>& A, const vector<double>& B, vector<double>& C,
-                        int M, int N, int K) {
-    for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
-            double sum = 0.0;
-            for (int k = 0; k < K; ++k) {
-                sum += A[IDX(i, k, K)] * B[IDX(k, j, N)];
-            }
-            C[IDX(i, j, N)] = sum;
-        }
-    }
+int freeMatrix(int ***mat) {
+    if (!mat || !(*mat)) return -1;
+    free((*mat)[0]); // free contiguous block
+    free(*mat);      // free row pointers
+    *mat = NULL;
+    return 0;
 }
 
-// Compare two matrices element-wise
-bool compare_matrices(const vector<double>& C1, const vector<double>& C2, int M, int N, double tol = 1e-6) {
-    for (int i = 0; i < M * N; ++i) {
-        if (fabs(C1[i] - C2[i]) > tol) {
-            return false;
-        }
-    }
-    return true;
+// compare two matrices equal element-wise
+int compareMatrices(int **X, int **Y, int rows, int cols) {
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            if (X[i][j] != Y[i][j]) return 0;
+    return 1;
 }
 
-// Print a matrix (only used for small sizes)
-void print_matrix(const vector<double>& mat, int rows, int cols, const string& name) {
-    cout << name << ":\n";
-    cout << fixed << setprecision(6);
+void printMatrix(int **M, int rows, int cols) {
     for (int i = 0; i < rows; ++i) {
-        for (int j = 0; j < cols; ++j) {
-            cout << mat[IDX(i, j, cols)] << " ";
-        }
-        cout << "\n";
+        for (int j = 0; j < cols; ++j) printf("%d ", M[i][j]);
+        printf("\n");
     }
-    cout << flush;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
 
-    int rank, size;
+    int worldSize, rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    if (size != 4) {
-        if (rank == 0)
-            cerr << "Error: This program requires exactly 4 MPI processes.\n";
+    if (argc < 4) {
+        if (rank == 0) fprintf(stderr, "Usage: %s M K N\n", argv[0]);
         MPI_Finalize();
-        return -1;
+        return 1;
     }
 
-    // Grid dimension
-    const int q = 2;
+    int M = atoi(argv[1]);
+    int K = atoi(argv[2]);
+    int N = atoi(argv[3]);
 
-    // Matrix sizes (must be divisible by q)
-    const int M = 10000;
-    const int K = 10000;
-    const int N = 10000;
-
-    if (M % q != 0 || K % q != 0 || N % q != 0) {
-        if (rank == 0)
-            cerr << "Error: M, K, N must be divisible by " << q << "\n";
+    // worldSize must be perfect square
+    double sq = sqrt((double)worldSize);
+    int p_sqrt = (int)sq;
+    if (p_sqrt * p_sqrt != worldSize) {
+        if (rank == 0) fprintf(stderr, "Number of processes must be a perfect square.\n");
         MPI_Finalize();
-        return -1;
+        return 1;
     }
 
-    int block_M = M / q;
-    int block_K = K / q;
-    int block_N = N / q;
-
-    int row = rank / q;
-    int col = rank % q;
-
-    // Initialize random seed differently for each rank
-    srand(time(0) + rank * 1234);
-
-    // Full matrices only on rank 0
-    vector<double> A, B, C;
-    if (rank == 0) {
-        A.resize(M * K);
-        B.resize(K * N);
-        C.resize(M * N, 0);
-
-        for (int i = 0; i < M * K; ++i)
-            A[i] = (double)(rand() % 10); // integer values for easier debugging
-
-        for (int i = 0; i < K * N; ++i)
-            B[i] = (double)(rand() % 10);
+    // block sizes must divide dims
+    if (M % p_sqrt != 0 || N % p_sqrt != 0 || K % p_sqrt != 0) {
+        if (rank == 0) {
+            fprintf(stderr, "M, K, N must be divisible by sqrt(P) = %d\n", p_sqrt);
+        }
+        MPI_Finalize();
+        return 1;
     }
 
-    // Local blocks for each process
-    vector<double> A_block(block_M * block_K);
-    vector<double> B_block(block_K * block_N);
-    vector<double> C_block(block_M * block_N, 0);
+    int procDim = p_sqrt;
+    int blockM = M / procDim; // each process block rows in A and C
+    int blockN = N / procDim; // each process block cols in B and C
+    int blockK = K / procDim;
 
-    // Scatter A blocks manually
+    // Create 2D Cartesian communicator (wrap-around)
+    int dims[2] = {procDim, procDim};
+    int periods[2] = {1,1}; // circular for Cannon
+    int reorder = 1;
+    MPI_Comm cartComm;
+    MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, reorder, &cartComm);
+
+    int coords[2];
+    MPI_Cart_coords(cartComm, rank, 2, coords);
+    int myRow = coords[0];
+    int myCol = coords[1];
+
+    // local blocks
+    int **localA = NULL, **localB = NULL, **localC = NULL;
+    allocMatrix(&localA, blockM, blockK);
+    allocMatrix(&localB, blockK, blockN);
+    allocMatrix(&localC, blockM, blockN);
+
+    for (int i = 0; i < blockM; ++i)
+        for (int j = 0; j < blockN; ++j)
+            localC[i][j] = 0;
+
+    // Rank 0 creates full matrices and sends blocks manually
+    int **A = NULL, **B = NULL, **C = NULL;
     if (rank == 0) {
-        // Send A blocks to other ranks
-        for (int r = 1; r < size; ++r) {
-            int r_row = r / q;
-            int r_col = r % q;
-            vector<double> temp(block_M * block_K);
-            for (int i = 0; i < block_M; ++i) {
-                for (int j = 0; j < block_K; ++j) {
-                    temp[IDX(i, j, block_K)] = A[IDX(r_row * block_M + i, r_col * block_K + j, K)];
+        allocMatrix(&A, M, K);
+        allocMatrix(&B, K, N);
+        allocMatrix(&C, M, N);
+
+        // === Identity for A, random for B ===
+        for (int i = 0; i < M; ++i)
+            for (int j = 0; j < K; ++j)
+                A[i][j] = (i == j ? 1 : 0);
+
+        srand((unsigned)time(NULL));
+        for (int i = 0; i < K; ++i)
+            for (int j = 0; j < N; ++j)
+                B[i][j] = rand() % 10;
+
+        // Distribute blocks
+        for (int r = 0; r < worldSize; ++r) {
+            int rc[2];
+            MPI_Cart_coords(cartComm, r, 2, rc);
+            int rRow = rc[0], rCol = rc[1];
+
+            int *tmpA = (int*)malloc(sizeof(int) * blockM * blockK);
+            int *tmpB = (int*)malloc(sizeof(int) * blockK * blockN);
+            for (int i = 0; i < blockM; ++i) {
+                int global_i = rRow * blockM + i;
+                for (int j = 0; j < blockK; ++j) {
+                    int global_j = rCol * blockK + j;
+                    tmpA[i * blockK + j] = A[global_i][global_j];
                 }
             }
-            MPI_Send(temp.data(), block_M * block_K, MPI_DOUBLE, r, 0, MPI_COMM_WORLD);
-        }
-        // Copy own block
-        for (int i = 0; i < block_M; ++i) {
-            for (int j = 0; j < block_K; ++j) {
-                A_block[IDX(i, j, block_K)] = A[IDX(0 * block_M + i, 0 * block_K + j, K)];
-            }
-        }
-    } else {
-        MPI_Recv(A_block.data(), block_M * block_K, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    }
-
-    // Scatter B blocks manually
-    if (rank == 0) {
-        // Send B blocks to other ranks
-        for (int r = 1; r < size; ++r) {
-            int r_row = r / q;
-            int r_col = r % q;
-            vector<double> temp(block_K * block_N);
-            for (int i = 0; i < block_K; ++i) {
-                for (int j = 0; j < block_N; ++j) {
-                    temp[IDX(i, j, block_N)] = B[IDX(r_row * block_K + i, r_col * block_N + j, N)];
+            for (int i = 0; i < blockK; ++i) {
+                int global_i = rRow * blockK + i;
+                for (int j = 0; j < blockN; ++j) {
+                    int global_j = rCol * blockN + j;
+                    tmpB[i * blockN + j] = B[global_i][global_j];
                 }
             }
-            MPI_Send(temp.data(), block_K * block_N, MPI_DOUBLE, r, 1, MPI_COMM_WORLD);
-        }
-        // Copy own block
-        for (int i = 0; i < block_K; ++i) {
-            for (int j = 0; j < block_N; ++j) {
-                B_block[IDX(i, j, block_N)] = B[IDX(0 * block_K + i, 0 * block_N + j, N)];
+
+            if (r == 0) {
+                for (int i = 0; i < blockM; ++i)
+                    for (int j = 0; j < blockK; ++j)
+                        localA[i][j] = tmpA[i * blockK + j];
+                for (int i = 0; i < blockK; ++i)
+                    for (int j = 0; j < blockN; ++j)
+                        localB[i][j] = tmpB[i * blockN + j];
+            } else {
+                MPI_Send(tmpA, blockM * blockK, MPI_INT, r, 100 + r, MPI_COMM_WORLD);
+                MPI_Send(tmpB, blockK * blockN, MPI_INT, r, 200 + r, MPI_COMM_WORLD);
             }
+            free(tmpA);
+            free(tmpB);
         }
     } else {
-        MPI_Recv(B_block.data(), block_K * block_N, MPI_DOUBLE, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(&(localA[0][0]), blockM * blockK, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(&(localB[0][0]), blockK * blockN, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
 
-    // Helper function for 2D rank grid
-    auto rank_2d = [q](int r, int c) { return ((r + q) % q) * q + ((c + q) % q); };
+    // Start timing only after distribution
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto start = high_resolution_clock::now();
 
-    // Initial shifts (Cannon's algorithm)
-    vector<double> A_temp = A_block;
-    vector<double> B_temp = B_block;
-
-    // A block shifts left by its row index
-    int src_A = rank_2d(row, (col + row) % q);
-    int dst_A = rank_2d(row, (col - row + q) % q);
-    MPI_Sendrecv_replace(A_block.data(), block_M * block_K, MPI_DOUBLE,
-                         dst_A, 10, src_A, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-    // B block shifts up by its column index
-    int src_B = rank_2d((row + col) % q, col);
-    int dst_B = rank_2d((row - col + q) % q, col);
-    MPI_Sendrecv_replace(B_block.data(), block_K * block_N, MPI_DOUBLE,
-                         dst_B, 20, src_B, 20, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-    // Cannon steps
-    for (int step = 0; step < q; ++step) {
-        multiply_add_blocks(A_block, B_block, C_block, block_M, block_K, block_N);
-
-        int dst_A_shift = rank_2d(row, (col - 1 + q) % q);
-        int src_A_shift = rank_2d(row, (col + 1) % q);
-        MPI_Sendrecv_replace(A_block.data(), block_M * block_K, MPI_DOUBLE,
-                             dst_A_shift, 30, src_A_shift, 30, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-        int dst_B_shift = rank_2d((row - 1 + q) % q, col);
-        int src_B_shift = rank_2d((row + 1) % q, col);
-        MPI_Sendrecv_replace(B_block.data(), block_K * block_N, MPI_DOUBLE,
-                             dst_B_shift, 40, src_B_shift, 40, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    // ---- Cannon algorithm ----
+    int left, right, up, down;
+    for (int s = 0; s < myRow; ++s) {
+        MPI_Cart_shift(cartComm, 1, 1, &left, &right);
+        MPI_Sendrecv_replace(&(localA[0][0]), blockM * blockK, MPI_INT, left, 11, right, 11, cartComm, MPI_STATUS_IGNORE);
+    }
+    for (int s = 0; s < myCol; ++s) {
+        MPI_Cart_shift(cartComm, 0, 1, &up, &down);
+        MPI_Sendrecv_replace(&(localB[0][0]), blockK * blockN, MPI_INT, up, 12, down, 12, cartComm, MPI_STATUS_IGNORE);
     }
 
-    // Gather C blocks to rank 0 manually
-    if (rank == 0) {
-        // Copy own block
-        for (int i = 0; i < block_M; ++i) {
-            for (int j = 0; j < block_N; ++j) {
-                C[IDX(i, j, N)] = C_block[IDX(i, j, block_N)];
+    int **tempRes = NULL;
+    allocMatrix(&tempRes, blockM, blockN);
+
+    for (int step = 0; step < procDim; ++step) {
+        for (int i = 0; i < blockM; ++i)
+            for (int j = 0; j < blockN; ++j) tempRes[i][j] = 0;
+
+        for (int i = 0; i < blockM; ++i)
+            for (int k = 0; k < blockK; ++k) {
+                int aij = localA[i][k];
+                for (int j = 0; j < blockN; ++j)
+                    tempRes[i][j] += aij * localB[k][j];
             }
-        }
 
-        for (int r = 1; r < size; ++r) {
-            int r_row = r / q;
-            int r_col = r % q;
-            vector<double> temp(block_M * block_N);
-            MPI_Recv(temp.data(), block_M * block_N, MPI_DOUBLE, r, 50, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        for (int i = 0; i < blockM; ++i)
+            for (int j = 0; j < blockN; ++j)
+                localC[i][j] += tempRes[i][j];
 
-            for (int i = 0; i < block_M; ++i) {
-                for (int j = 0; j < block_N; ++j) {
-                    C[IDX(r_row * block_M + i, r_col * block_N + j, N)] = temp[IDX(i, j, block_N)];
+        MPI_Cart_shift(cartComm, 1, 1, &left, &right);
+        MPI_Sendrecv_replace(&(localA[0][0]), blockM * blockK, MPI_INT, left, 21, right, 21, cartComm, MPI_STATUS_IGNORE);
+
+        MPI_Cart_shift(cartComm, 0, 1, &up, &down);
+        MPI_Sendrecv_replace(&(localB[0][0]), blockK * blockN, MPI_INT, up, 22, down, 22, cartComm, MPI_STATUS_IGNORE);
+    }
+
+    freeMatrix(&tempRes);
+
+    // Gather results
+    if (rank == 0) {
+        for (int i = 0; i < blockM; ++i)
+            for (int j = 0; j < blockN; ++j)
+                C[i][j] = localC[i][j];
+
+        for (int r = 1; r < worldSize; ++r) {
+            int rc[2];
+            MPI_Cart_coords(cartComm, r, 2, rc);
+            int rRow = rc[0], rCol = rc[1];
+            int *tmp = (int*)malloc(sizeof(int) * blockM * blockN);
+            MPI_Recv(tmp, blockM * blockN, MPI_INT, r, 300 + r, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            for (int i = 0; i < blockM; ++i) {
+                int global_i = rRow * blockM + i;
+                for (int j = 0; j < blockN; ++j) {
+                    int global_j = rCol * blockN + j;
+                    C[global_i][global_j] = tmp[i * blockN + j];
                 }
             }
+            free(tmp);
         }
     } else {
-        MPI_Send(C_block.data(), block_M * block_N, MPI_DOUBLE, 0, 50, MPI_COMM_WORLD);
+        int *tmp = (int*)malloc(sizeof(int) * blockM * blockN);
+        for (int i = 0; i < blockM; ++i)
+            for (int j = 0; j < blockN; ++j)
+                tmp[i * blockN + j] = localC[i][j];
+        MPI_Send(tmp, blockM * blockN, MPI_INT, 0, 300 + rank, MPI_COMM_WORLD);
+        free(tmp);
     }
 
-    // Correctness check on rank 0
+    // Stop timing
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto end = high_resolution_clock::now();
+
     if (rank == 0) {
-        vector<double> C_ref(M * N, 0);
-        serial_matrix_mult(A, B, C_ref, M, N, K);
+        auto duration = duration_cast<milliseconds>(end - start);
+        printf("Execution time: %lld ms\n", (long long)duration.count());
 
-        // NOTE: The print_matrix function is commented out to avoid excessive output for large matrices.
-        // Uncomment for small test cases (e.g., M=4, N=4, K=4)
-        /*
-        cout << "\nMatrix A:\n"; print_matrix(A, M, K, "A");
-        cout << "\nMatrix B:\n"; print_matrix(B, K, N, "B");
-        cout << "\nResult Matrix C (Parallel):\n"; print_matrix(C, M, N, "C_parallel");
-        cout << "\nResult Matrix C (Serial):\n"; print_matrix(C_ref, M, N, "C_serial");
-        */
-
-        if (compare_matrices(C, C_ref, M, N)) {
-            cout << "\nTest PASSED: Parallel and serial results match.\n";
+        // === Correctness: since A is I, expect C == B ===
+        int ok = compareMatrices(B, C, M, N);
+        if (ok) {
+            printf("Result CORRECT (C == B, as A was identity).\n");
         } else {
-            cout << "\nTest FAILED: Results do not match.\n";
+            printf("Result INCORRECT! C != B\n");
+            printf("B (first few rows):\n");
+            printMatrix(B, (K<8?K:8), (N<8?N:8));
+            printf("C (computed) (first few rows):\n");
+            printMatrix(C, (M<8?M:8), (N<8?N:8));
         }
     }
 
+    // cleanup
+    freeMatrix(&localA);
+    freeMatrix(&localB);
+    freeMatrix(&localC);
+    if (rank == 0) {
+        freeMatrix(&A);
+        freeMatrix(&B);
+        freeMatrix(&C);
+    }
+
+    MPI_Comm_free(&cartComm);
     MPI_Finalize();
     return 0;
 }
